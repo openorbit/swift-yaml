@@ -1031,10 +1031,13 @@ public struct YAMLParser {
                 return .string(string)
             }
             if first.isNumber || (first == "-" && input.dropFirst().first?.isNumber == true) {
-                guard let number = parseNumber(&input) else {
-                    throw YAMLParseError.invalidScalar
+                let original = input
+                if let number = parseNumber(&input) {
+                    if isValueTerminator(input.first) {
+                        return number
+                    }
                 }
-                return number
+                input = original
             }
         }
         if let string = parseBareString(&input) {
@@ -1174,6 +1177,11 @@ public struct YAMLParser {
         }
         let next = input[index]
         return next.isWhitespace || next == "#" || next == "," || next == "]" || next == "}"
+    }
+
+    private func isValueTerminator(_ character: Character?) -> Bool {
+        guard let character else { return true }
+        return character.isWhitespace || character == "#" || character == "," || character == "]" || character == "}" || character == ":"
     }
 
     private func parseFlowSequence(_ input: inout Substring) throws -> YAMLValue {
@@ -1395,10 +1403,42 @@ public struct YAMLParser {
     private func parseInlineValue(_ content: Substring) throws -> YAMLValue {
         var input = content[...]
         consumeWhitespaceAndComments(&input)
-        let value = try parseValue(&input)
-        consumeWhitespaceAndComments(&input)
-        if !input.isEmpty {
+        guard !input.isEmpty else {
+            throw YAMLParseError.invalidScalar
+        }
+        if let first = input.first, first == "[" || first == "{" {
+            let value = try parseValue(&input)
+            consumeWhitespaceAndComments(&input)
+            if !input.isEmpty {
+                throw YAMLParseError.trailingCharacters
+            }
+            return value
+        }
+        if let first = input.first, first == "\"" || first == "'" {
+            guard let string = parseQuotedString(&input) else {
+                throw YAMLParseError.invalidScalar
+            }
+            consumeWhitespaceAndComments(&input)
+            if !input.isEmpty {
+                throw YAMLParseError.trailingCharacters
+            }
+            return .string(string)
+        }
+        let stripped = stripInlineComment(input)
+        let trimmed = stripTrailingSpaces(stripped)
+        if trimmed.contains(where: { $0.isWhitespace }) {
+            return .string(String(trimmed))
+        }
+        var temp = trimmed[...]
+        let value = try parseScalar(&temp)
+        consumeWhitespaceAndComments(&temp)
+        if !temp.isEmpty {
             throw YAMLParseError.trailingCharacters
+        }
+        if case .string = value,
+           let numericInfo = numericLikeInfo(trimmed),
+           numericInfo.dotCount <= 1 {
+            throw YAMLParseError.invalidScalar
         }
         return value
     }
@@ -1411,6 +1451,33 @@ public struct YAMLParser {
         return input[cursor...]
     }
 
+    private func stripTrailingSpaces(_ input: Substring) -> Substring {
+        var end = input.endIndex
+        while end > input.startIndex {
+            let before = input.index(before: end)
+            if input[before] == " " || input[before] == "\t" {
+                end = before
+                continue
+            }
+            break
+        }
+        return input[..<end]
+    }
+
+    private func stripInlineComment(_ input: Substring) -> Substring {
+        var index = input.startIndex
+        var previousWasWhitespace = false
+        while index < input.endIndex {
+            let character = input[index]
+            if character == "#" && previousWasWhitespace {
+                return input[..<index]
+            }
+            previousWasWhitespace = character.isWhitespace
+            index = input.index(after: index)
+        }
+        return input
+    }
+
     private func isOnlyWhitespace(_ input: Substring) -> Bool {
         var cursor = input.startIndex
         while cursor < input.endIndex {
@@ -1420,6 +1487,28 @@ public struct YAMLParser {
             cursor = input.index(after: cursor)
         }
         return true
+    }
+
+    private func numericLikeInfo(_ input: Substring) -> (dotCount: Int, digitCount: Int)? {
+        var dotCount = 0
+        var digitCount = 0
+        var index = input.startIndex
+        while index < input.endIndex {
+            let character = input[index]
+            if character == "." {
+                dotCount += 1
+            } else if character == "-" {
+                if index != input.startIndex {
+                    return nil
+                }
+            } else if character.isNumber {
+                digitCount += 1
+            } else {
+                return nil
+            }
+            index = input.index(after: index)
+        }
+        return digitCount > 0 ? (dotCount, digitCount) : nil
     }
 
     private func parseInlineMappingPair(_ content: Substring) throws -> (key: String, value: YAMLValue)? {

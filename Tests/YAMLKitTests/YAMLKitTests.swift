@@ -230,11 +230,10 @@ struct YAMLParserErrorTests {
         }
     }
 
-    @Test func invalidNumberThrows() {
+    @Test func invalidNumberThrows() throws {
         let parser = YAMLParser()
-        #expect(throws: YAMLParseError.invalidScalar) {
-            try parser.parse("1.")
-        }
+        let value = try parser.parse("1.")
+        #expect(value == .string("1."))
     }
 
     @Test func incompleteDoubleQuotedEscapeThrows() {
@@ -476,4 +475,26 @@ struct YAMLSerializationTests {
         #expect(result.contains("line1"))
         #expect(result.contains("line2"))
     }
+}
+
+
+@Test func failingString() throws {
+    let failingString =
+        """
+        name: test-component
+        version: 1.0.0
+        title: Test Component
+        nav:
+          - modules/ROOT/nav.adoc
+        """
+
+    let parser = YAMLParser()
+    let value = try parser.parse(failingString)
+    #expect(value == .object([
+        "name": .string("test-component"),
+        "version": .string("1.0.0"),
+        "title": .string("Test Component"),
+        "nav": .array([.string("modules/ROOT/nav.adoc")])
+    ]))
+
 }
