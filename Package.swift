@@ -22,5 +22,12 @@ let package = Package(
             name: "YAMLKitTests",
             dependencies: ["YAMLKit"]
         ),
+        .testTarget(
+            name: "YAMLTestSuiteTests",
+            dependencies: ["YAMLKit"],
+            resources: [
+                .copy("data")
+            ]
+        ),
     ]
 )
