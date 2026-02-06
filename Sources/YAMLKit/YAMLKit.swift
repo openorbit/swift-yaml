@@ -7,8 +7,9 @@
 // Native YAML 1.2 implementation in Swift.
 
 import Foundation
+import OrderedCollections
 
-public typealias YAMLObject = [String: YAMLValue]
+public typealias YAMLObject = OrderedDictionary<String, YAMLValue>
 public typealias YAMLArray = [YAMLValue]
 
 public enum YAMLValue: Equatable, Sendable {
@@ -119,7 +120,8 @@ extension YAMLValue: ExpressibleByArrayLiteral {
 
 extension YAMLValue: ExpressibleByDictionaryLiteral {
     public init(dictionaryLiteral elements: (String, YAMLValue)...) {
-        var object = YAMLObject(minimumCapacity: elements.count)
+        var object: YAMLObject = [:]
+        object.reserveCapacity(elements.count)
         for (key, value) in elements {
             object[key] = value
         }
@@ -228,10 +230,10 @@ public struct YAMLSerializer {
     public init() {}
 
     public func serialize(_ value: YAMLValue) -> String {
-        serializeValue(value, indent: 0) + "\n"
+        serializeValue(value, indent: 0, allowFlow: true) + "\n"
     }
 
-    private func serializeValue(_ value: YAMLValue, indent: Int) -> String {
+    private func serializeValue(_ value: YAMLValue, indent: Int, allowFlow: Bool) -> String {
         switch value {
         case .null:
             return "null"
@@ -246,7 +248,7 @@ public struct YAMLSerializer {
         case .array(let array):
             return serializeArray(array, indent: indent)
         case .object(let object):
-            return serializeObject(object, indent: indent)
+            return serializeObject(object, indent: indent, allowFlow: allowFlow)
         }
     }
 
@@ -254,47 +256,54 @@ public struct YAMLSerializer {
         guard !array.isEmpty else {
             return "[]"
         }
-        if array.allSatisfy(isSimpleScalar) {
-            let items = array.map { serializeValue($0, indent: indent) }.joined(separator: ", ")
-            return "[\(items)]"
-        }
         let prefix = String(repeating: " ", count: indent)
         let childIndent = indent + 2
-        let childPrefix = String(repeating: " ", count: childIndent)
         return array.map { value in
             if isSimpleScalar(value) {
-                return "\(prefix)- \(serializeValue(value, indent: childIndent))"
+                return "\(prefix)- \(serializeValue(value, indent: childIndent, allowFlow: false))"
             }
-            let nested = serializeValue(value, indent: childIndent)
-            return "\(prefix)-\n\(childPrefix)\(indentLines(nested, indent: childIndent))"
+            if case .string(let string) = value, string.contains("\n") {
+                return serializeMultilineStringInSequence(string, indent: indent)
+            }
+            let nested = serializeValue(value, indent: childIndent, allowFlow: false)
+            let (first, rest) = splitFirstLine(nested)
+            if let first {
+                let trimmedFirst = trimLeadingSpacesString(first)
+                var lines = ["\(prefix)- \(trimmedFirst)"]
+                if let rest {
+                    lines.append(rest)
+                }
+                return lines.joined(separator: "\n")
+            }
+            return "\(prefix)-"
         }.joined(separator: "\n")
     }
 
-    private func serializeObject(_ object: YAMLObject, indent: Int) -> String {
+    private func serializeObject(_ object: YAMLObject, indent: Int, allowFlow: Bool) -> String {
         guard !object.isEmpty else {
             return "{}"
         }
-        let keys = object.keys.sorted()
-        if keys.allSatisfy({ key in
+        let keys = Array(object.keys)
+        let canFlow = allowFlow && indent == 0 && keys.allSatisfy({ key in
             guard let value = object[key] else { return false }
             return isSimpleScalar(value) && isBareKey(key)
-        }) {
+        })
+        if canFlow {
             let pairs = keys.map { key in
-                "\(key): \(serializeValue(object[key]!, indent: indent))"
+                "\(key): \(serializeValue(object[key]!, indent: indent, allowFlow: false))"
             }.joined(separator: ", ")
             return "{\(pairs)}"
         }
         let prefix = String(repeating: " ", count: indent)
         let childIndent = indent + 2
-        let childPrefix = String(repeating: " ", count: childIndent)
         return keys.map { key in
             let value = object[key]!
             let keyText = isBareKey(key) ? key : serializeString(key, indent: indent)
             if isSimpleScalar(value) {
-                return "\(prefix)\(keyText): \(serializeValue(value, indent: childIndent))"
+                return "\(prefix)\(keyText): \(serializeValue(value, indent: childIndent, allowFlow: false))"
             }
-            let nested = serializeValue(value, indent: childIndent)
-            return "\(prefix)\(keyText):\n\(childPrefix)\(indentLines(nested, indent: childIndent))"
+            let nested = serializeValue(value, indent: childIndent, allowFlow: false)
+            return "\(prefix)\(keyText):\n\(indentLines(nested, indent: childIndent))"
         }.joined(separator: "\n")
     }
 
@@ -323,6 +332,16 @@ public struct YAMLSerializer {
         return "\"\(escaped)\""
     }
 
+    private func serializeMultilineStringInSequence(_ string: String, indent: Int) -> String {
+        let prefix = String(repeating: " ", count: indent)
+        let childIndent = String(repeating: " ", count: indent + 2)
+        let indented = string
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "\(childIndent)\($0)" }
+            .joined(separator: "\n")
+        return "\(prefix)- |\n\(indented)"
+    }
+
     private func isSimpleScalar(_ value: YAMLValue) -> Bool {
         switch value {
         case .null, .bool, .int, .double:
@@ -340,7 +359,7 @@ public struct YAMLSerializer {
             return false
         }
         for character in string {
-            if character.isWhitespace || character == ":" || character == "#" || character == "," ||
+            if character == ":" || character == "#" || character == "," ||
                 character == "[" || character == "]" || character == "{" || character == "}" {
                 return false
             }
@@ -359,7 +378,27 @@ public struct YAMLSerializer {
             .map { "\(prefix)\($0)" }
             .joined(separator: "\n")
     }
+
+    private func splitFirstLine(_ string: String) -> (String?, String?) {
+        guard let newlineIndex = string.firstIndex(of: "\n") else {
+            return string.isEmpty ? (nil, nil) : (string, nil)
+        }
+        let first = String(string[..<newlineIndex])
+        let restStart = string.index(after: newlineIndex)
+        let rest = restStart <= string.endIndex ? String(string[restStart...]) : ""
+        return (first, rest.isEmpty ? nil : rest)
+    }
+
+    private func trimLeadingSpacesString(_ string: String) -> String {
+        var index = string.startIndex
+        while index < string.endIndex, string[index].isWhitespace {
+            index = string.index(after: index)
+        }
+        return String(string[index...])
+    }
+
 }
+
 
 private final class _YAMLDecoder: Decoder {
     let value: YAMLValue
@@ -1274,6 +1313,10 @@ public struct YAMLParser {
         }
         if isBlockSequenceLine(first, indent: first.indent) || isBlockMappingLine(first, indent: first.indent) {
             let value = try parseBlockValue(&cursor, indent: first.indent)
+            advanceToNextNonEmptyLine(&cursor)
+            if cursor.index < cursor.lines.count {
+                throw YAMLParseError.trailingCharacters
+            }
             return value
         }
         return nil
@@ -1489,6 +1532,21 @@ public struct YAMLParser {
         return true
     }
 
+    private func isAnchorOnly(_ input: Substring) -> Bool {
+        let trimmed = trimLeadingSpaces(input)
+        guard let first = trimmed.first, first == "&" || first == "*" else {
+            return false
+        }
+        var cursor = trimmed.index(after: trimmed.startIndex)
+        if cursor >= trimmed.endIndex {
+            return false
+        }
+        while cursor < trimmed.endIndex, !trimmed[cursor].isWhitespace {
+            cursor = trimmed.index(after: cursor)
+        }
+        return isOnlyWhitespace(trimmed[cursor...])
+    }
+
     private func numericLikeInfo(_ input: Substring) -> (dotCount: Int, digitCount: Int)? {
         var dotCount = 0
         var digitCount = 0
@@ -1644,7 +1702,8 @@ public struct YAMLParser {
                 throw YAMLParseError.nonStringKey
             }
             let value: YAMLValue
-            if isOnlyWhitespace(valuePart) {
+            let trimmedValue = trimLeadingSpaces(valuePart)
+            if isOnlyWhitespace(valuePart) || isAnchorOnly(trimmedValue) {
                 cursor.index += 1
                 if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
                     value = try parseBlockValue(&cursor, indent: nestedIndent)

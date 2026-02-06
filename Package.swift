@@ -12,11 +12,17 @@ let package = Package(
             targets: ["YAMLKit"]
         ),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-collections", from: "1.1.4")
+    ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "YAMLKit"
+            name: "YAMLKit",
+            dependencies: [
+                .product(name: "OrderedCollections", package: "swift-collections")
+            ]
         ),
         .testTarget(
             name: "YAMLKitTests",
