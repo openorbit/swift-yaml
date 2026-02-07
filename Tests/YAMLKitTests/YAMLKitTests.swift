@@ -107,31 +107,31 @@ struct YAMLParserScalarTests {
     @Test func parsesQuotedString() throws {
         let parser = YAMLParser()
         let value = try parser.parse("\"hello\"")
-        #expect(value == .string("hello"))
+        #expect(value == .styledString("hello", .doubleQuoted))
     }
 
     @Test func parsesSingleQuotedString() throws {
         let parser = YAMLParser()
         let value = try parser.parse("'world'")
-        #expect(value == .string("world"))
+        #expect(value == .styledString("world", .singleQuoted))
     }
 
     @Test func parsesDoubleQuotedEscapes() throws {
         let parser = YAMLParser()
         let value = try parser.parse("\"line\\n\\tindent\\\\\"")
-        #expect(value == .string("line\n\tindent\\"))
+        #expect(value == .styledString("line\n\tindent\\", .doubleQuoted))
     }
 
     @Test func parsesQuotedStringWithHash() throws {
         let parser = YAMLParser()
         let value = try parser.parse("\"hash#inside\"")
-        #expect(value == .string("hash#inside"))
+        #expect(value == .styledString("hash#inside", .doubleQuoted))
     }
 
     @Test func parsesSingleQuotedWithHash() throws {
         let parser = YAMLParser()
         let value = try parser.parse("'hash#inside'")
-        #expect(value == .string("hash#inside"))
+        #expect(value == .styledString("hash#inside", .singleQuoted))
     }
 
     @Test func parsesBareString() throws {
@@ -361,25 +361,25 @@ struct YAMLParserBlockScalarTests {
     @Test func parsesLiteralBlockScalarInMapping() throws {
         let parser = YAMLParser()
         let value = try parser.parse("a: |\n  line1\n  line2\n")
-        #expect(value == .object(["a": .string("line1\nline2\n")]))
+        #expect(value == .object(["a": .styledString("line1\nline2\n", .literalBlock)]))
     }
 
     @Test func parsesFoldedBlockScalarInMapping() throws {
         let parser = YAMLParser()
         let value = try parser.parse("a: >\n  line1\n  line2\n")
-        #expect(value == .object(["a": .string("line1 line2\n")]))
+        #expect(value == .object(["a": .styledString("line1\nline2\n", .foldedBlock)]))
     }
 
     @Test func parsesLiteralBlockScalarInSequence() throws {
         let parser = YAMLParser()
         let value = try parser.parse("- |\n  hello\n")
-        #expect(value == .array([.string("hello\n")]))
+        #expect(value == .array([.styledString("hello\n", .literalBlock)]))
     }
 
     @Test func parsesFoldedBlockScalarWithBlankLines() throws {
         let parser = YAMLParser()
         let value = try parser.parse("a: >\n  hello\n\n  world\n")
-        #expect(value == .object(["a": .string("hello\nworld\n")]))
+        #expect(value == .object(["a": .styledString("hello\n\nworld\n", .foldedBlock)]))
     }
 }
 
@@ -472,7 +472,7 @@ struct YAMLSerializationTests {
 
     @Test func serializesLiteralString() {
         let serializer = YAMLSerializer()
-        let value: YAMLValue = .string("line1\nline2\n")
+        let value: YAMLValue = .styledString("line1\nline2\n", .literalBlock)
         let result = serializer.serialize(value)
         #expect(result.contains("|\n"))
         #expect(result.contains("line1"))

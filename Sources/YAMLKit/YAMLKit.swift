@@ -53,16 +53,27 @@ public struct YAMLKey: Hashable, Sendable, ExpressibleByStringLiteral, Codable {
 public typealias YAMLObject = OrderedDictionary<YAMLKey, YAMLValue>
 public typealias YAMLArray = [YAMLValue]
 
+public enum YAMLStringStyle: Sendable {
+    case plain
+    case singleQuoted
+    case doubleQuoted
+    case literalBlock
+    case foldedBlock
+}
+
 public indirect enum YAMLValue: Equatable, Sendable {
     case null
     case bool(Bool)
     case int(Int)
     case double(Double)
     case string(String)
+    case styledString(String, YAMLStringStyle)
     case array(YAMLArray)
     case object(YAMLObject)
+    case tagged(String, YAMLValue)
     case anchored(String, YAMLValue)
-    case documentStart(YAMLValue)
+    case documentStart(YAMLValue, inline: Bool)
+    case documentStream([YAMLValue])
 
     public subscript(key: String) -> YAMLValue? {
         guard case .object(let object) = self else {
@@ -79,10 +90,14 @@ public indirect enum YAMLValue: Equatable, Sendable {
     }
 
     public var stringValue: String? {
-        guard case .string(let value) = self else {
+        switch self {
+        case .string(let value):
+            return value
+        case .styledString(let value, _):
+            return value
+        default:
             return nil
         }
-        return value
     }
 
     public var intValue: Int? {
@@ -229,14 +244,20 @@ extension YAMLValue: Codable {
             try container.encode(value)
         case .string(let value):
             try container.encode(value)
+        case .styledString(let value, _):
+            try container.encode(value)
         case .array(let value):
             try container.encode(value)
         case .object(let value):
             try container.encode(value)
+        case .tagged(_, let value):
+            try container.encode(value)
         case .anchored(_, let value):
             try container.encode(value)
-        case .documentStart(let value):
+        case .documentStart(let value, _):
             try container.encode(value)
+        case .documentStream(let values):
+            try container.encode(values)
         }
     }
 }
@@ -292,14 +313,20 @@ public struct YAMLSerializer {
             return String(double)
         case .string(let string):
             return serializeString(string, indent: indent)
+        case .styledString(let string, let style):
+            return serializeStyledString(string, style: style, indent: indent)
         case .array(let array):
             return serializeArray(array, indent: indent)
         case .object(let object):
             return serializeObject(object, indent: indent, allowFlow: allowFlow)
+        case .tagged(let tag, let value):
+            return serializeTaggedValue(tag: tag, value: value, indent: indent)
         case .anchored(let anchor, let value):
             return serializeAnchoredValue(anchor: anchor, value: value, indent: indent)
-        case .documentStart(let value):
-            return serializeDocumentStart(value)
+        case .documentStart(let value, let inline):
+            return serializeDocumentStart(value, inline: inline)
+        case .documentStream(let documents):
+            return serializeDocumentStream(documents)
         }
     }
 
@@ -315,9 +342,6 @@ public struct YAMLSerializer {
             }
             if isSimpleScalar(value) {
                 return "\(prefix)- \(serializeValue(value, indent: childIndent, allowFlow: false))"
-            }
-            if case .string(let string) = value, string.contains("\n") {
-                return serializeMultilineStringInSequence(string, indent: indent)
             }
             let nested = serializeValue(value, indent: childIndent, allowFlow: false)
             let (first, rest) = splitFirstLine(nested)
@@ -340,7 +364,7 @@ public struct YAMLSerializer {
         let keys = Array(object.keys)
         let canFlow = allowFlow && indent == 0 && keys.allSatisfy({ key in
             guard let value = object[key] else { return false }
-            return isSimpleScalar(value) && isBareKey(key)
+            return isSimpleScalar(value) && isBareKey(key) && !containsLineBreaks(value)
         })
         if canFlow {
             let pairs = keys.map { key in
@@ -355,6 +379,15 @@ public struct YAMLSerializer {
             let keyText = serializeKey(key, indent: indent)
             let inlineSeparator = needsSpaceBeforeColon(key) ? " : " : ": "
             let blockSeparator = needsSpaceBeforeColon(key) ? " :\n" : ":\n"
+            if case .null = value {
+                return "\(prefix)\(keyText):"
+            }
+            if case .object(let nested) = value, nested.count == 1,
+               let nestedPair = nested.first(where: { _ in true }),
+               isNullLike(nestedPair.value) {
+                let nestedKeyText = serializeKey(nestedPair.key, indent: indent)
+                return "\(prefix)\(keyText)\(inlineSeparator)\(nestedKeyText):"
+            }
             if case .anchored(let anchor, let anchoredValue) = value {
                 return serializeAnchoredMappingValue(
                     anchor: anchor,
@@ -376,27 +409,36 @@ public struct YAMLSerializer {
 
     private func serializeString(_ string: String, indent: Int) -> String {
         if string.contains("\n") {
-            let prefix = String(repeating: " ", count: indent)
-            let indented = string
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .map { "\(prefix)  \($0)" }
-                .joined(separator: "\n")
-            return "|\n\(indented)"
+            return serializeSingleQuotedString(string)
         }
         if isBareString(string) {
             return string
         }
-        var escaped = ""
-        for character in string {
-            switch character {
-            case "\"": escaped.append("\\\"")
-            case "\\": escaped.append("\\\\")
-            case "\n": escaped.append("\\n")
-            case "\t": escaped.append("\\t")
-            default: escaped.append(character)
-            }
+        return serializeDoubleQuotedString(string)
+    }
+
+    private func serializeStyledString(_ string: String, style: YAMLStringStyle, indent: Int) -> String {
+        switch style {
+        case .plain:
+            return serializeString(string, indent: indent)
+        case .singleQuoted:
+            return serializeSingleQuotedString(string)
+        case .doubleQuoted:
+            return serializeDoubleQuotedString(string)
+        case .literalBlock:
+            return serializeBlockScalar(string, indent: indent, indicator: "|")
+        case .foldedBlock:
+            return serializeBlockScalar(string, indent: indent, indicator: ">")
         }
-        return "\"\(escaped)\""
+    }
+
+    private func serializeBlockScalar(_ string: String, indent: Int, indicator: String) -> String {
+        let prefix = String(repeating: " ", count: indent)
+        let indented = string
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "\(prefix)  \($0)" }
+            .joined(separator: "\n")
+        return "\(prefix)\(indicator)\n\(indented)"
     }
 
     private func serializeMultilineStringInSequence(_ string: String, indent: Int) -> String {
@@ -409,12 +451,38 @@ public struct YAMLSerializer {
         return "\(prefix)- |\n\(indented)"
     }
 
-    private func serializeDocumentStart(_ value: YAMLValue) -> String {
-        let serialized = serializeValue(value, indent: 0, allowFlow: true)
-        if serialized.contains("\n") {
-            return "---\n\(serialized)"
+    private func serializeDocumentStart(_ value: YAMLValue, inline: Bool) -> String {
+        if case .tagged(let tag, let inner) = value {
+            let serializedInner = serializeValue(inner, indent: 0, allowFlow: false)
+            if !serializedInner.contains("\n"), (inline || isSimpleScalar(inner)) {
+                return "--- \(tag) \(serializedInner)"
+            }
+            return "--- \(tag)\n\(serializedInner)"
         }
-        return "--- \(serialized)"
+        if case .styledString(let string, let style) = value, style == .literalBlock || style == .foldedBlock {
+            let indicator = style == .literalBlock ? "|" : ">"
+            return "--- \(serializeBlockScalar(string, indent: 0, indicator: indicator))"
+        }
+        let serialized = serializeValue(value, indent: 0, allowFlow: true)
+        if inline, !serialized.contains("\n") {
+            return "--- \(serialized)"
+        }
+        if case .string(let string) = value, isBareString(string), !serialized.contains("\n") {
+            return "--- \(serialized)"
+        }
+        return "---\n\(serialized)"
+    }
+
+    private func serializeDocumentStream(_ documents: [YAMLValue]) -> String {
+        let parts = documents.map { document in
+            switch document {
+            case .documentStart(let value, let inline):
+                return serializeDocumentStart(value, inline: inline)
+            default:
+                return serializeDocumentStart(document, inline: false)
+            }
+        }
+        return parts.joined(separator: "\n")
     }
 
     private func serializeAnchoredValue(anchor: String, value: YAMLValue, indent: Int) -> String {
@@ -423,6 +491,22 @@ public struct YAMLSerializer {
         }
         let nested = serializeValue(value, indent: indent, allowFlow: false)
         return "&\(anchor)\n\(nested)"
+    }
+
+    private func serializeTaggedValue(tag: String, value: YAMLValue, indent: Int) -> String {
+        if isSimpleScalar(value) {
+            return "\(tag) \(serializeValue(value, indent: indent, allowFlow: false))"
+        }
+        let nested: String
+        switch value {
+        case .object(let object):
+            nested = serializeObject(object, indent: indent, allowFlow: false)
+        case .array(let array):
+            nested = serializeArray(array, indent: indent)
+        default:
+            nested = serializeValue(value, indent: indent, allowFlow: false)
+        }
+        return "\(tag)\n\(nested)"
     }
 
     private func serializeAnchoredMappingValue(
@@ -455,9 +539,31 @@ public struct YAMLSerializer {
         switch value {
         case .null, .bool, .int, .double:
             return true
+        case .string:
+            return true
+        case .styledString(_, let style):
+            if style == .literalBlock || style == .foldedBlock {
+                return false
+            }
+            return true
+        case .tagged(_, let value):
+            return isSimpleScalar(value)
+        case .array, .object, .anchored, .documentStart, .documentStream:
+            return false
+        }
+    }
+
+    private func containsLineBreaks(_ value: YAMLValue) -> Bool {
+        switch value {
         case .string(let string):
-            return !string.contains("\n")
-        case .array, .object, .anchored, .documentStart:
+            return string.contains("\n")
+        case .styledString(let string, _):
+            return string.contains("\n")
+        case .tagged(_, let nested):
+            return containsLineBreaks(nested)
+        case .anchored(_, let nested):
+            return containsLineBreaks(nested)
+        default:
             return false
         }
     }
@@ -480,11 +586,21 @@ public struct YAMLSerializer {
         key.style == .plain && isBareString(key.rawValue)
     }
 
+    private func isNullLike(_ value: YAMLValue) -> Bool {
+        if case .null = value {
+            return true
+        }
+        if case .anchored(_, let nested) = value, case .null = nested {
+            return true
+        }
+        return false
+    }
+
     private func serializeKey(_ key: YAMLKey, indent: Int) -> String {
         let base: String
         switch key.style {
         case .plain:
-            base = isBareString(key.rawValue) ? key.rawValue : serializeString(key.rawValue, indent: indent)
+            base = key.rawValue
         case .singleQuoted:
             base = serializeSingleQuotedString(key.rawValue)
         case .doubleQuoted:
@@ -1177,7 +1293,7 @@ public struct YAMLParser {
         }
         var input = source[...]
         consumeWhitespaceAndComments(&input)
-        let hasDocumentStart = skipDirectivesAndDocumentStart(&input)
+        let documentStart = skipDirectivesAndDocumentStart(&input)
         consumeWhitespaceAndComments(&input)
         guard !input.isEmpty else {
             throw YAMLParseError.emptyDocument
@@ -1187,7 +1303,10 @@ public struct YAMLParser {
         if !input.isEmpty {
             throw YAMLParseError.trailingCharacters
         }
-        return hasDocumentStart ? .documentStart(value) : value
+        if documentStart.saw {
+            return .documentStart(value, inline: documentStart.inline)
+        }
+        return value
     }
 
     private func parseValue(_ input: inout Substring) throws -> YAMLValue {
@@ -1217,10 +1336,11 @@ public struct YAMLParser {
         }
         if let first = input.first {
             if first == "\"" || first == "'" {
+                let style: YAMLStringStyle = first == "'" ? .singleQuoted : .doubleQuoted
                 guard let string = parseQuotedString(&input) else {
                     throw YAMLParseError.invalidScalar
                 }
-                return .string(string)
+                return .styledString(string, style)
             }
             if first.isNumber || (first == "-" && input.dropFirst().first?.isNumber == true) {
                 let original = input
@@ -1390,10 +1510,11 @@ public struct YAMLParser {
         }
     }
 
-    private func skipDirectivesAndDocumentStart(_ input: inout Substring) -> Bool {
+    private func skipDirectivesAndDocumentStart(_ input: inout Substring) -> (saw: Bool, inline: Bool) {
         var sawDocumentStart = false
+        var sawInlineDocumentStart = false
         while true {
-            if input.hasPrefix("%YAML") {
+            if input.hasPrefix("%") {
                 consumeLine(&input)
                 consumeWhitespaceAndComments(&input)
                 continue
@@ -1401,15 +1522,30 @@ public struct YAMLParser {
             if input.hasPrefix("---") {
                 let after = input.index(input.startIndex, offsetBy: 3)
                 if after == input.endIndex || input[after].isWhitespace {
+                    let remainder = input[after...]
+                    var cursor = remainder.startIndex
+                    while cursor < remainder.endIndex,
+                          remainder[cursor].isWhitespace,
+                          remainder[cursor] != "\n" {
+                        cursor = remainder.index(after: cursor)
+                    }
+                    if cursor < remainder.endIndex,
+                       remainder[cursor] != "\n",
+                       remainder[cursor] != "#" {
+                        sawInlineDocumentStart = true
+                    }
                     input = input[after...]
                     sawDocumentStart = true
+                    if sawInlineDocumentStart {
+                        return (true, true)
+                    }
                     consumeWhitespaceAndComments(&input)
                     continue
                 }
             }
             break
         }
-        return sawDocumentStart
+        return (sawDocumentStart, sawInlineDocumentStart)
     }
 
     private func consumeLine(_ input: inout Substring) {
@@ -1520,36 +1656,110 @@ public struct YAMLParser {
     private func parseBlockDocumentIfPresent(_ source: String) throws -> YAMLValue? {
         let lines = makeLines(from: source)
         var cursor = LineCursor(lines: lines, index: 0)
-        var sawDocumentStart = false
+        var documents: [YAMLValue] = []
         advanceToNextNonEmptyLine(&cursor)
-        while cursor.index < cursor.lines.count {
-            let line = cursor.lines[cursor.index]
-            let trimmed = trimLeadingSpaces(line.content)
-            if isDirectiveLine(trimmed) {
-                cursor.index += 1
-                advanceToNextNonEmptyLine(&cursor)
+
+        while true {
+            if cursor.index >= cursor.lines.count {
+                break
+            }
+            var sawDocumentStart = false
+            var didAppendDocument = false
+            while cursor.index < cursor.lines.count {
+                let line = cursor.lines[cursor.index]
+                let trimmed = trimLeadingSpaces(line.content)
+                if isDirectiveLine(trimmed) {
+                    cursor.index += 1
+                    advanceToNextNonEmptyLine(&cursor)
+                    continue
+                }
+                if isDocumentStartLine(trimmed) {
+                    sawDocumentStart = true
+                    if let inlineContent = inlineContentAfterDocumentStart(trimmed) {
+                        if let tagName = parseTagName(from: inlineContent), isTagOnlyLine(inlineContent) {
+                            cursor.index += 1
+                            advanceToNextNonEmptyLine(&cursor)
+                            if let first = peekNonEmptyLine(cursor) {
+                                let value = try parseBlockValue(&cursor, indent: first.indent)
+                                documents.append(.documentStart(.tagged(tagName, value), inline: false))
+                                advanceToNextNonEmptyLine(&cursor)
+                                didAppendDocument = true
+                                break
+                            }
+                            documents.append(.documentStart(.tagged(tagName, .null), inline: false))
+                            advanceToNextNonEmptyLine(&cursor)
+                            didAppendDocument = true
+                            break
+                        }
+                        if isBlockScalarIndicator(inlineContent) {
+                            if let blockScalar = try parseInlineBlockScalar(&cursor, indent: line.indent, remainder: inlineContent) {
+                                documents.append(.documentStart(blockScalar, inline: false))
+                                advanceToNextNonEmptyLine(&cursor)
+                                didAppendDocument = true
+                                break
+                            }
+                        }
+                        let value = try parseInlineValue(inlineContent)
+                        documents.append(.documentStart(value, inline: true))
+                        cursor.index += 1
+                        advanceToNextNonEmptyLine(&cursor)
+                        didAppendDocument = true
+                        break
+                    }
+                    cursor.index += 1
+                    advanceToNextNonEmptyLine(&cursor)
+                    continue
+                }
+                break
+            }
+
+            if didAppendDocument {
                 continue
             }
-            if isDocumentStartLine(trimmed) {
-                sawDocumentStart = true
-                cursor.index += 1
-                advanceToNextNonEmptyLine(&cursor)
+
+            guard let first = peekNonEmptyLine(cursor) else {
+                break
+            }
+            let firstTrimmed = trimLeadingSpaces(first.content)
+            if isDocumentStartLine(firstTrimmed) || isDirectiveLine(firstTrimmed) {
                 continue
+            }
+            if isBlockSequenceLine(first, indent: first.indent) ||
+                isBlockMappingLine(first, indent: first.indent) ||
+                anchorNameIfOnly(firstTrimmed) != nil {
+                let value = try parseBlockValue(&cursor, indent: first.indent)
+                let documentValue = sawDocumentStart ? .documentStart(value, inline: false) : value
+                documents.append(documentValue)
+                advanceToNextNonEmptyLine(&cursor)
+                if cursor.index < cursor.lines.count {
+                    let next = cursor.lines[cursor.index]
+                    let trimmed = trimLeadingSpaces(next.content)
+                    if !isDocumentStartLine(trimmed) && !isDirectiveLine(trimmed) {
+                        throw YAMLParseError.trailingCharacters
+                    }
+                }
+                continue
+            }
+
+            if documents.isEmpty {
+                return nil
             }
             break
         }
-        guard let first = peekNonEmptyLine(cursor) else {
+
+        if documents.isEmpty {
             return nil
         }
-        if isBlockSequenceLine(first, indent: first.indent) || isBlockMappingLine(first, indent: first.indent) {
-            let value = try parseBlockValue(&cursor, indent: first.indent)
-            advanceToNextNonEmptyLine(&cursor)
-            if cursor.index < cursor.lines.count {
+        if documents.count == 1 {
+            return documents[0]
+        }
+        if let next = peekNonEmptyLine(cursor) {
+            let trimmed = trimLeadingSpaces(next.content)
+            if !isDocumentStartLine(trimmed) && !isDirectiveLine(trimmed) {
                 throw YAMLParseError.trailingCharacters
             }
-            return sawDocumentStart ? .documentStart(value) : value
         }
-        return nil
+        return .documentStream(documents)
     }
 
     private func makeLines(from source: String) -> [Line] {
@@ -1575,7 +1785,7 @@ public struct YAMLParser {
     }
 
     private func isDirectiveLine(_ content: Substring) -> Bool {
-        return content.hasPrefix("%YAML")
+        return content.hasPrefix("%")
     }
 
     private func isDocumentStartLine(_ content: Substring) -> Bool {
@@ -1587,6 +1797,77 @@ public struct YAMLParser {
         }
         let index = content.index(content.startIndex, offsetBy: 3)
         return index < content.endIndex ? content[index].isWhitespace : true
+    }
+
+    private func inlineContentAfterDocumentStart(_ content: Substring) -> Substring? {
+        guard content.hasPrefix("---") else {
+            return nil
+        }
+        let after = content.index(content.startIndex, offsetBy: 3)
+        guard after < content.endIndex else {
+            return nil
+        }
+        var remainder = content[after...]
+        while let first = remainder.first, first.isWhitespace, first != "\n" {
+            remainder.removeFirst()
+        }
+        guard let first = remainder.first, first != "#" else {
+            return nil
+        }
+        let stripped = stripInlineComment(remainder)
+        let trimmed = stripTrailingSpaces(stripped)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func isTagOnlyLine(_ content: Substring) -> Bool {
+        return parseTagName(from: content) != nil && !content.contains(where: { $0.isWhitespace })
+    }
+
+    private func isBlockScalarIndicator(_ content: Substring) -> Bool {
+        let trimmed = trimLeadingSpaces(content)
+        guard let first = trimmed.first, first == "|" || first == ">" else {
+            return false
+        }
+        var index = trimmed.index(after: trimmed.startIndex)
+        var sawChomp = false
+        var sawIndent = false
+        while index < trimmed.endIndex, !trimmed[index].isWhitespace {
+            let character = trimmed[index]
+            if (character == "+" || character == "-") && !sawChomp {
+                sawChomp = true
+                index = trimmed.index(after: index)
+                continue
+            }
+            if character.isNumber && !sawIndent {
+                if character == "0" {
+                    return false
+                }
+                sawIndent = true
+                index = trimmed.index(after: index)
+                continue
+            }
+            return false
+        }
+        while index < trimmed.endIndex, trimmed[index].isWhitespace {
+            index = trimmed.index(after: index)
+        }
+        if index == trimmed.endIndex {
+            return true
+        }
+        return trimmed[index] == "#"
+    }
+
+    private func parseTagName(from content: Substring) -> String? {
+        let trimmed = trimLeadingSpaces(content)
+        guard trimmed.first == "!" else {
+            return nil
+        }
+        var cursor = trimmed.startIndex
+        while cursor < trimmed.endIndex, !trimmed[cursor].isWhitespace {
+            cursor = trimmed.index(after: cursor)
+        }
+        let tag = trimmed[..<cursor]
+        return tag.isEmpty ? nil : String(tag)
     }
 
     private func peekNonEmptyLine(_ cursor: LineCursor) -> Line? {
@@ -1631,8 +1912,65 @@ public struct YAMLParser {
             return try parseBlockMapping(&cursor, indent: indent)
         }
         let inline = trimLeadingSpaces(line.content)
+        if let anchor = anchorNameIfOnly(inline) {
+            cursor.index += 1
+            if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent) {
+                return .anchored(anchor, try parseBlockValue(&cursor, indent: nestedIndent))
+            }
+            return .anchored(anchor, .null)
+        }
+        return try parsePlainScalar(&cursor, indent: indent)
+    }
+
+    private func parsePlainScalar(_ cursor: inout LineCursor, indent: Int) throws -> YAMLValue {
+        guard cursor.index < cursor.lines.count else {
+            throw YAMLParseError.emptyDocument
+        }
+        let line = cursor.lines[cursor.index]
+        let trimmed = trimLeadingSpaces(line.content)
         cursor.index += 1
-        return try parseInlineValue(inline)
+        return try parsePlainScalarContinuation(&cursor, indent: indent, initialLine: trimmed)
+    }
+
+    private func parsePlainScalarContinuation(
+        _ cursor: inout LineCursor,
+        indent: Int,
+        initialLine: Substring
+    ) throws -> YAMLValue {
+        var lines: [String] = [String(initialLine)]
+        while cursor.index < cursor.lines.count {
+            let line = cursor.lines[cursor.index]
+            let trimmed = trimLeadingSpaces(line.content)
+            if line.indent < indent, !trimmed.isEmpty {
+                break
+            }
+            if line.indent == indent {
+                if isDocumentStartLine(trimmed) || isDirectiveLine(trimmed) {
+                    break
+                }
+                if isBlockSequenceLine(line, indent: indent) || isBlockMappingLine(line, indent: indent) {
+                    break
+                }
+            }
+            if trimmed.first == "#" {
+                break
+            }
+            if trimmed.isEmpty {
+                lines.append("")
+                cursor.index += 1
+                continue
+            }
+            let extraIndent = max(0, line.indent - indent)
+            let prefix = extraIndent > 0 ? String(repeating: " ", count: extraIndent) : ""
+            lines.append(prefix + String(line.content))
+            cursor.index += 1
+        }
+        let joined = lines.joined(separator: "\n")
+        var folded = foldBlockScalar(joined)
+        if folded.hasSuffix("\n") {
+            folded.removeLast()
+        }
+        return .string(folded)
     }
 
     private func parseBlockSequence(_ cursor: inout LineCursor, indent: Int) throws -> YAMLValue {
@@ -1699,7 +2037,7 @@ public struct YAMLParser {
     private func parseInlineValue(_ content: Substring) throws -> YAMLValue {
         var input = content[...]
         consumeWhitespaceAndComments(&input)
-        guard !input.isEmpty else {
+        if input.isEmpty {
             throw YAMLParseError.invalidScalar
         }
         if let first = input.first, first == "[" || first == "{" {
@@ -1711,6 +2049,7 @@ public struct YAMLParser {
             return value
         }
         if let first = input.first, first == "\"" || first == "'" {
+            let style: YAMLStringStyle = first == "'" ? .singleQuoted : .doubleQuoted
             guard let string = parseQuotedString(&input) else {
                 throw YAMLParseError.invalidScalar
             }
@@ -1718,10 +2057,13 @@ public struct YAMLParser {
             if !input.isEmpty {
                 throw YAMLParseError.trailingCharacters
             }
-            return .string(string)
+            return .styledString(string, style)
         }
         let stripped = stripInlineComment(input)
         let trimmed = stripTrailingSpaces(stripped)
+        if let first = trimmed.first, first == "|" || first == ">" {
+            throw YAMLParseError.invalidScalar
+        }
         if let first = trimmed.first, first == "&" {
             var anchoredInput = trimmed[...]
             if let anchored = try parseAnchoredInline(&anchoredInput) {
@@ -1748,11 +2090,14 @@ public struct YAMLParser {
     private func parseInlineKey(_ content: Substring) throws -> YAMLKey {
         var input = content[...]
         consumeWhitespaceAndComments(&input)
-        guard !input.isEmpty else {
-            throw YAMLParseError.invalidScalar
+        if input.isEmpty {
+            return YAMLKey(rawValue: "", style: .plain, anchor: nil)
         }
         if let (anchor, remainder) = parseAnchorPrefix(input) {
             input = remainder
+            if input.first == ":" {
+                input = input.dropFirst()
+            }
             consumeWhitespaceAndComments(&input)
             let key = try parseInlineKey(input)
             return YAMLKey(rawValue: key.rawValue, style: key.style, anchor: anchor)
@@ -1768,16 +2113,19 @@ public struct YAMLParser {
             let style: YAMLKey.Style = first == "'" ? .singleQuoted : .doubleQuoted
             return YAMLKey(rawValue: string, style: style, anchor: nil)
         }
-        let value = try parseInlineValue(input)
-        guard case .string(let key) = value else {
-            throw YAMLParseError.nonStringKey
+        let trimmed = stripTrailingSpaces(input)
+        guard !trimmed.isEmpty else {
+            throw YAMLParseError.invalidScalar
         }
-        return YAMLKey(rawValue: key, style: .plain, anchor: nil)
+        return YAMLKey(rawValue: String(trimmed), style: .plain, anchor: nil)
     }
 
     private func parseKeyScalar(_ input: inout Substring) throws -> YAMLKey {
         if let (anchor, remainder) = parseAnchorPrefix(input) {
             input = remainder
+            if input.first == ":" {
+                input = input.dropFirst()
+            }
             consumeWhitespaceAndComments(&input)
             let key = try parseKeyScalar(&input)
             return YAMLKey(rawValue: key.rawValue, style: key.style, anchor: anchor)
@@ -1789,11 +2137,30 @@ public struct YAMLParser {
             let style: YAMLKey.Style = first == "'" ? .singleQuoted : .doubleQuoted
             return YAMLKey(rawValue: string, style: style, anchor: nil)
         }
-        let value = try parseScalar(&input)
-        guard case .string(let key) = value else {
+        var cursor = input.startIndex
+        while cursor < input.endIndex, input[cursor] != ":" {
+            cursor = input.index(after: cursor)
+        }
+        if cursor == input.startIndex {
+            input = input[cursor...]
+            return YAMLKey(rawValue: "", style: .plain, anchor: nil)
+        }
+        let keyPart = stripTrailingSpaces(input[..<cursor])
+        guard !keyPart.isEmpty else {
             throw YAMLParseError.nonStringKey
         }
-        return YAMLKey(rawValue: key, style: .plain, anchor: nil)
+        var scalarInput = keyPart[...]
+        let scalarValue = try parseScalar(&scalarInput)
+        if scalarInput.isEmpty {
+            switch scalarValue {
+            case .string, .styledString:
+                break
+            default:
+                throw YAMLParseError.nonStringKey
+            }
+        }
+        input = input[cursor...]
+        return YAMLKey(rawValue: String(keyPart), style: .plain, anchor: nil)
     }
 
     private func parseAnchorPrefix(_ input: Substring) -> (String, Substring)? {
@@ -1907,13 +2274,10 @@ public struct YAMLParser {
         if trimmed.first == "[" || trimmed.first == "{" {
             return nil
         }
-        guard let colonIndex = trimmed.firstIndex(of: ":") else {
+        guard let colonIndex = mappingSeparatorIndex(in: trimmed) else {
             return nil
         }
         let afterColon = trimmed.index(after: colonIndex)
-        if afterColon < trimmed.endIndex, !trimmed[afterColon].isWhitespace {
-            return nil
-        }
         let keyPart = trimmed[..<colonIndex]
         let valuePart = trimmed[afterColon...]
         let key = try parseInlineKey(keyPart)
@@ -1935,15 +2299,41 @@ public struct YAMLParser {
         guard let style = trimmed.first, style == "|" || style == ">" else {
             return nil
         }
-        let afterStyle = trimmed.index(after: trimmed.startIndex)
-        if afterStyle < trimmed.endIndex, !trimmed[afterStyle].isWhitespace {
+        var index = trimmed.index(after: trimmed.startIndex)
+        var chompingIndicator: Character?
+        var indentIndicator: Int?
+        while index < trimmed.endIndex {
+            let character = trimmed[index]
+            if (character == "+" || character == "-") && chompingIndicator == nil {
+                chompingIndicator = character
+                index = trimmed.index(after: index)
+                continue
+            }
+            if character.isNumber, indentIndicator == nil {
+                if character == "0" {
+                    return nil
+                }
+                indentIndicator = Int(String(character))
+                index = trimmed.index(after: index)
+                continue
+            }
+            break
+        }
+        let rest = trimmed[index...]
+        if let first = rest.first, !first.isWhitespace, first != "#" {
             return nil
         }
+        _ = chompingIndicator
         cursor.index += 1
-        let scalarIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) ?? (indent + 1)
+        let scalarIndent: Int
+        if let indentIndicator {
+            scalarIndent = indent + indentIndicator
+        } else {
+            scalarIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) ?? (indent + 1)
+        }
         let content = collectBlockScalarLines(&cursor, indent: scalarIndent)
-        let value = style == "|" ? content : foldBlockScalar(content)
-        return .string(value)
+        let stringStyle: YAMLStringStyle = style == "|" ? .literalBlock : .foldedBlock
+        return .styledString(content, stringStyle)
     }
 
     private func collectBlockScalarLines(_ cursor: inout LineCursor, indent: Int) -> String {
@@ -2022,7 +2412,30 @@ public struct YAMLParser {
                 break
             }
             let content = trimLeadingSpaces(line.content)
-            guard let colonIndex = content.firstIndex(of: ":") else {
+            if let first = content.first, first == "?" {
+                let after = content.index(after: content.startIndex)
+                if after == content.endIndex || content[after].isWhitespace {
+                    let keyPart = trimLeadingSpaces(content[after...])
+                    let key = keyPart.isEmpty ? YAMLKey(rawValue: "", style: .plain, anchor: nil) : try parseInlineKey(keyPart)
+                    cursor.index += 1
+                    advanceToNextNonEmptyLine(&cursor)
+                    if cursor.index < cursor.lines.count {
+                        let valueLine = cursor.lines[cursor.index]
+                        if valueLine.indent == indent {
+                            let valueContent = trimLeadingSpaces(valueLine.content)
+                            if valueContent.first == ":" {
+                                let valuePart = valueContent[valueContent.index(after: valueContent.startIndex)...]
+                                let value = try parseExplicitValuePart(&cursor, indent: indent, valuePart: valuePart)
+                                object[key] = value
+                                continue
+                            }
+                        }
+                    }
+                    object[key] = .null
+                    continue
+                }
+            }
+            guard let colonIndex = mappingSeparatorIndex(in: content) else {
                 throw YAMLParseError.expectedMappingSeparator
             }
             let keyPart = content[..<colonIndex]
@@ -2048,13 +2461,48 @@ public struct YAMLParser {
                 if let blockScalar = try parseInlineBlockScalar(&cursor, indent: indent, remainder: valuePart) {
                     value = blockScalar
                 } else {
-                    cursor.index += 1
-                    value = try parseInlineValue(valuePart)
+                    var lookahead = cursor
+                    lookahead.index += 1
+                    if let nextIndent = nextNonEmptyIndent(lookahead, minimum: indent + 1), nextIndent > indent {
+                        let initial = trimLeadingSpaces(valuePart)
+                        cursor.index += 1
+                        value = try parsePlainScalarContinuation(&cursor, indent: indent, initialLine: initial)
+                    } else {
+                        cursor.index += 1
+                        value = try parseInlineValue(valuePart)
+                    }
                 }
             }
             object[key] = value
         }
         return object
+    }
+
+    private func parseExplicitValuePart(
+        _ cursor: inout LineCursor,
+        indent: Int,
+        valuePart: Substring
+    ) throws -> YAMLValue {
+        let trimmedValue = trimLeadingSpaces(valuePart)
+        if let anchor = anchorNameIfOnly(trimmedValue) {
+            cursor.index += 1
+            if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
+                return .anchored(anchor, try parseBlockValue(&cursor, indent: nestedIndent))
+            }
+            return .anchored(anchor, .null)
+        }
+        if isOnlyWhitespace(valuePart) {
+            cursor.index += 1
+            if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
+                return try parseBlockValue(&cursor, indent: nestedIndent)
+            }
+            return .null
+        }
+        if let blockScalar = try parseInlineBlockScalar(&cursor, indent: indent, remainder: valuePart) {
+            return blockScalar
+        }
+        cursor.index += 1
+        return try parseInlineValue(valuePart)
     }
 
     private func nextNonEmptyIndent(_ cursor: LineCursor, minimum: Int) -> Int? {
@@ -2091,10 +2539,47 @@ public struct YAMLParser {
         if content.first == "[" || content.first == "{" {
             return false
         }
-        guard let colonIndex = content.firstIndex(of: ":") else {
+        if let first = content.first, first == "?" {
+            let after = content.index(after: content.startIndex)
+            if after == content.endIndex || content[after].isWhitespace {
+                return true
+            }
+        }
+        guard let colonIndex = mappingSeparatorIndex(in: content) else {
             return false
         }
         let afterColon = content.index(after: colonIndex)
         return afterColon == content.endIndex || content[afterColon].isWhitespace
+    }
+
+    private func mappingSeparatorIndex(in content: Substring) -> String.Index? {
+        var startIndex = content.startIndex
+        if content.first == "&" {
+            var cursor = content.index(after: content.startIndex)
+            while cursor < content.endIndex, !content[cursor].isWhitespace, content[cursor] != ":" {
+                cursor = content.index(after: cursor)
+            }
+            if cursor < content.endIndex, content[cursor] == ":" {
+                let after = content.index(after: cursor)
+                if after == content.endIndex || content[after].isWhitespace {
+                    var lookahead = after
+                    while lookahead < content.endIndex, content[lookahead].isWhitespace {
+                        lookahead = content.index(after: lookahead)
+                    }
+                    startIndex = lookahead
+                }
+            }
+        }
+        var index = startIndex
+        while index < content.endIndex {
+            if content[index] == ":" {
+                let after = content.index(after: index)
+                if after == content.endIndex || content[after].isWhitespace {
+                    return index
+                }
+            }
+            index = content.index(after: index)
+        }
+        return nil
     }
 }
