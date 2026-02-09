@@ -206,7 +206,8 @@ private func writeHTMLReport(results: [YAMLTestResult]) throws -> URL {
         outputURL = URL(fileURLWithPath: reportPath)
     } else {
         let filename = "yaml-test-suite-report.html"
-        outputURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(filename)
+        outputURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(filename)
     }
 
     let passedCount = results.filter { $0.passed }.count
