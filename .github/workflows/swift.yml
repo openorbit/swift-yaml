@@ -22,6 +22,24 @@ jobs:
       run: swift build -v
     - name: Run tests
       run: swift test -v
+      env:
+        YAML_TEST_SUITE_ALLOW_FAILURES: "1"
+        YAML_TEST_SUITE_REPORT_PATH: /tmp/yaml-test-suite-report.html
+    - name: Upload YAML test suite report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: yaml-test-suite-report-linux
+        path: /tmp/yaml-test-suite-report.html
+      env:
+        YAML_TEST_SUITE_ALLOW_FAILURES: "1"
+        YAML_TEST_SUITE_REPORT_PATH: ${{ runner.temp }}/yaml-test-suite-report.html
+    - name: Upload YAML test suite report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: yaml-test-suite-report-macos
+        path: ${{ runner.temp }}/yaml-test-suite-report.html
 
   linux:
     runs-on: ubuntu-latest

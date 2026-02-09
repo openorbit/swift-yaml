@@ -1284,8 +1284,31 @@ public enum YAMLParseError: Error, Equatable {
     case invalidBlockIndentation
 }
 
+public enum YAMLSchema: Sendable {
+    case failsafe
+    case json
+    case core
+
+    fileprivate var resolvesPlainScalars: Bool {
+        switch self {
+        case .failsafe:
+            return false
+        case .json, .core:
+            return true
+        }
+    }
+}
+
+public typealias YAMLScalarResolver = (String) -> YAMLValue?
+
 public struct YAMLParser {
-    public init() {}
+    public let schema: YAMLSchema
+    public let customResolvers: [YAMLScalarResolver]
+
+    public init(schema: YAMLSchema = .core, customResolvers: [YAMLScalarResolver] = []) {
+        self.schema = schema
+        self.customResolvers = customResolvers
+    }
 
     public func parse(_ source: String) throws -> YAMLValue {
         if let blockValue = try parseBlockDocumentIfPresent(source) {
@@ -1322,18 +1345,6 @@ public struct YAMLParser {
     }
 
     private func parseScalar(_ input: inout Substring) throws -> YAMLValue {
-        if input.hasPrefix("null") && isDelimiter(after: input, prefixCount: 4) {
-            input.removeFirst(4)
-            return .null
-        }
-        if input.hasPrefix("true") && isDelimiter(after: input, prefixCount: 4) {
-            input.removeFirst(4)
-            return .bool(true)
-        }
-        if input.hasPrefix("false") && isDelimiter(after: input, prefixCount: 5) {
-            input.removeFirst(5)
-            return .bool(false)
-        }
         if let first = input.first {
             if first == "\"" || first == "'" {
                 let style: YAMLStringStyle = first == "'" ? .singleQuoted : .doubleQuoted
@@ -1342,24 +1353,12 @@ public struct YAMLParser {
                 }
                 return .styledString(string, style)
             }
-            if first.isNumber || (first == "-" && input.dropFirst().first?.isNumber == true) {
-                let original = input
-                if let number = parseNumber(&input) {
-                    if isValueTerminator(input.first) {
-                        return number
-                    }
-                }
-                input = original
-            }
-        }
-        if let anchored = try parseAnchoredInline(&input) {
-            return anchored
         }
         if let anchored = try parseAnchoredInline(&input) {
             return anchored
         }
         if let string = parseBareString(&input) {
-            return .string(string)
+            return resolvePlainScalar(string)
         }
         throw YAMLParseError.invalidScalar
     }
@@ -1431,6 +1430,31 @@ public struct YAMLParser {
         }
         input = original[cursor...]
         return .int(value)
+    }
+
+    private func resolvePlainScalar(_ string: String) -> YAMLValue {
+        for resolver in customResolvers {
+            if let resolved = resolver(string) {
+                return resolved
+            }
+        }
+        guard schema.resolvesPlainScalars else {
+            return .string(string)
+        }
+        if string == "null" {
+            return .null
+        }
+        if string == "true" {
+            return .bool(true)
+        }
+        if string == "false" {
+            return .bool(false)
+        }
+        var input = Substring(string)
+        if let number = parseNumber(&input), input.isEmpty {
+            return number
+        }
+        return .string(string)
     }
 
     private func parseQuotedString(_ input: inout Substring) -> String? {
@@ -2080,6 +2104,7 @@ public struct YAMLParser {
             throw YAMLParseError.trailingCharacters
         }
         if case .string = value,
+           schema.resolvesPlainScalars,
            let numericInfo = numericLikeInfo(trimmed),
            numericInfo.dotCount <= 1 {
             throw YAMLParseError.invalidScalar
