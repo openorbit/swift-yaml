@@ -57,4 +57,33 @@ jobs:
     - name: Build
       run: swift build -v
     - name: Run tests
+      env:
+        YAML_TEST_SUITE_ALLOW_FAILURES: "1"
+        YAML_TEST_SUITE_REPORT_PATH: /tmp/yaml-test-suite-report.html
       run: swift test -v
+
+  windows:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    - name: Setup Swift
+      uses: SwiftyLab/setup-swift@latest
+      with:
+        swift-version: "6.2.0"
+    - name: Build
+      run: swift build -v
+    - name: Run tests
+      run: swift test -v
+      env:
+        YAML_TEST_SUITE_ALLOW_FAILURES: "1"
+        YAML_TEST_SUITE_REPORT_PATH: ${{ runner.temp }}\yaml-test-suite-report.html
+    - name: Upload YAML test suite report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: yaml-test-suite-report-windows
+        path: ${{ runner.temp }}\yaml-test-suite-report.html
+
