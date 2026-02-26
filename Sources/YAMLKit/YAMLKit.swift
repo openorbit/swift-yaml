@@ -2470,14 +2470,22 @@ public struct YAMLParser {
             let trimmedValue = trimLeadingSpaces(valuePart)
             if let anchor = anchorNameIfOnly(trimmedValue) {
                 cursor.index += 1
-                if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
+                if let next = peekNonEmptyLine(cursor),
+                   next.indent == indent,
+                   isBlockSequenceLine(next, indent: indent) {
+                    value = .anchored(anchor, try parseBlockValue(&cursor, indent: indent))
+                } else if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
                     value = .anchored(anchor, try parseBlockValue(&cursor, indent: nestedIndent))
                 } else {
                     value = .anchored(anchor, .null)
                 }
             } else if isOnlyWhitespace(valuePart) {
                 cursor.index += 1
-                if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
+                if let next = peekNonEmptyLine(cursor),
+                   next.indent == indent,
+                   isBlockSequenceLine(next, indent: indent) {
+                    value = try parseBlockValue(&cursor, indent: indent)
+                } else if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
                     value = try parseBlockValue(&cursor, indent: nestedIndent)
                 } else {
                     value = .null
@@ -2511,6 +2519,11 @@ public struct YAMLParser {
         let trimmedValue = trimLeadingSpaces(valuePart)
         if let anchor = anchorNameIfOnly(trimmedValue) {
             cursor.index += 1
+            if let next = peekNonEmptyLine(cursor),
+               next.indent == indent,
+               isBlockSequenceLine(next, indent: indent) {
+                return .anchored(anchor, try parseBlockValue(&cursor, indent: indent))
+            }
             if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
                 return .anchored(anchor, try parseBlockValue(&cursor, indent: nestedIndent))
             }
@@ -2518,6 +2531,11 @@ public struct YAMLParser {
         }
         if isOnlyWhitespace(valuePart) {
             cursor.index += 1
+            if let next = peekNonEmptyLine(cursor),
+               next.indent == indent,
+               isBlockSequenceLine(next, indent: indent) {
+                return try parseBlockValue(&cursor, indent: indent)
+            }
             if let nestedIndent = nextNonEmptyIndent(cursor, minimum: indent + 1) {
                 return try parseBlockValue(&cursor, indent: nestedIndent)
             }

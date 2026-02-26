@@ -501,3 +501,22 @@ struct YAMLSerializationTests {
     ]))
 
 }
+@Test func anotherFailingString() throws {
+    let antoraYml = """
+    name: test-component
+    version: 1.0.0
+    title: Test Component
+    nav:
+    - modules/ROOT/nav.adoc
+    """
+
+    let parser = YAMLParser()
+    let value = try parser.parse(antoraYml)
+    #expect(value == .object([
+        "name": .string("test-component"),
+        "version": .string("1.0.0"),
+        "title": .string("Test Component"),
+        "nav": .array([.string("modules/ROOT/nav.adoc")])
+    ]))
+
+}
